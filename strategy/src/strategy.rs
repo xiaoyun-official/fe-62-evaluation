@@ -1,6 +1,7 @@
 use super::*;
 use diagnostics::Condition as C;
 use rsvz::core::model::ActivationFact;
+mod stack_layout;
 
 // Flag-wave Football full-damage boundary is332cs under natural movement.
 // Leave one update of margin; this is an effect time, not a planting time.
@@ -24,6 +25,7 @@ struct CherryPlan {
 }
 
 pub struct Control {
+    stack_prepared: bool,
     decision_period: i32,
     cherry_period: i32,
     next_economy_check: i32,
@@ -71,6 +73,7 @@ pub struct Control {
 impl Default for Control {
     fn default() -> Self {
         Self {
+            stack_prepared: false,
             decision_period: setting("SIX_DECISION_PERIOD", 20).max(1) as i32,
             cherry_period: setting("SIX_CHERRY_PERIOD", 250).max(1) as i32,
             next_economy_check: 0,
@@ -681,6 +684,12 @@ impl Control {
             if self.late_nuke(w) && Self::known_next_clock(w).is_some_and(|next| next <= rsvz::timing::clock() + 100) {
                 return;
             }
+            // Recompare legal pits at the actual planting frame: a cached choice
+            // may predate an expired pit or a changed damage obligation.
+            let now = rsvz::timing::clock();
+            self.planner.observe(now, self.last_ice);
+            self.next_pit_check = 0;
+            self.refresh_forecast(now, w, t);
             if w == 20 && combat::doom_position(self.preferred(w), false) == Some((4, 7)) {
                 let now = rsvz::timing::clock();
                 if now < self.next_w20_doom_check {
@@ -700,7 +709,11 @@ impl Control {
         }
     }
     fn jala_target(&self, w: i32) -> i32 {
-        if w == 20 { W20_JALA_EFFECT } else { 2400 }
+        match w {
+            20 => W20_JALA_EFFECT,
+            10 => 2500,
+            _ => 2400,
+        }
     }
     fn sync_shadow(&mut self, w: i32, t: i32) {
         if self.policy.enabled() || !policy::shadow_enabled() {
@@ -912,6 +925,7 @@ impl Control {
         let pref = self.preferred(w);
         let mut doom_pos = combat::doom_position(pref, false).unwrap_or(pref);
         let jala_target = self.jala_target(w);
+        let next_jala_target = self.jala_target(w + 1);
         let mut ice_available = [cd(sel(IceShroom)) + 100, cd(COPY) + 420];
         let mut doom_available = cd(sel(DoomShroom)) + 100;
         if hp(LilyPad, doom_pos).is_none() {
@@ -1003,7 +1017,15 @@ impl Control {
         }
         if w < 20 {
             let early_due = early_nuke_due(doom_available - next_start, length, current_first_ice);
-            let next_early = next_nuke && !next_late && !matches!(next, 10 | 20) && length > 2969 && early_due <= 1831;
+            // An unobserved refresh cannot establish the long preceding wave
+            // required by the early-nuke branch. Use the ordinary next ice
+            // until the actual refresh clock makes that branch executable.
+            let next_early = Self::known_next_clock(w).is_some()
+                && next_nuke
+                && !next_late
+                && !matches!(next, 10 | 20)
+                && length > 2969
+                && early_due <= 1831;
             let next_ice = if next_early {
                 100
             } else if matches!(next, 10 | 20) {
@@ -1039,12 +1061,7 @@ impl Control {
                     false,
                 );
                 f.add(
-                    (if next == 20 {
-                        next_start + W20_JALA_EFFECT
-                    } else {
-                        next_start + 2400
-                    })
-                    .max(jala_available),
+                    (next_start + next_jala_target).max(jala_available),
                     E::Jalapeno,
                     (6, 2),
                     false,
@@ -1325,6 +1342,17 @@ impl Control {
         true
     }
     pub fn tick(&mut self) {
+        if !self.stack_prepared {
+            self.stack_prepared = true;
+            match stack_layout::prepare() {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(e) => {
+                    rsvz::fail_script(e);
+                    return;
+                }
+            }
+        }
         let _perf = crate::perf::scope("strategy::tick");
         let (now, w, t) = time();
         let period = if self.policy.enabled() { 5 } else { self.decision_period };
@@ -1434,7 +1462,7 @@ impl Control {
             }
         }
         if !decision_due {
-            if self.planner.blover_contact_due(w, t) {
+            if self.planner.blover_contact_due(w, t, &self.forecast) {
                 self.planner.observe(now, self.last_ice);
                 self.refresh_forecast(now, w, t);
                 self.planner.blover(w, t, &self.forecast);
@@ -1499,6 +1527,20 @@ impl Control {
         if self.planner.retention_started(now) {
             self.planner.observe(now, self.last_ice);
             self.refresh_forecast(now, w, t);
+        }
+        // W19 must not spend the remaining window on tail storage while a
+        // visible Football will enter before the actual next Pepper recharge.
+        if w == 19 && t >= 400 {
+            self.planner.observe(now, self.last_ice);
+            self.refresh_forecast(now, w, t);
+            if self.planner.guard_w19_football(&self.forecast) {
+                self.jala_done = true;
+                self.last_jala_wave = w;
+            }
+            if telemetry::serial() != before_pads {
+                self.planner.observe(now, self.last_ice);
+                self.refresh_forecast(now, w, t);
+            }
         }
         if matches!(w, 9..=12 | 19 | 20) && ready(sel(PuffShroom)) {
             if telemetry::serial() != before_pads {
